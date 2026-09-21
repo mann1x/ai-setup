@@ -6,6 +6,7 @@ import {
   isCaliberCommand,
   isNpxResolution,
   resolveWindowsNodeBinInvocation,
+  resolveCaliberHookInvoker,
 } from './resolve-caliber.js';
 import { bashPath } from '../utils/windows.js';
 
@@ -14,10 +15,12 @@ const REFRESH_TAIL = 'refresh --quiet';
 const HOOK_DESCRIPTION = 'Caliber: auto-refreshing docs based on code changes';
 
 function getHookCommand(): string {
-  // Use node-direct on Windows (no VBS — SessionEnd may need stdout).
-  const cmd = resolveCaliber();
-  const direct = resolveWindowsNodeBinInvocation(cmd);
-  return `${direct ?? cmd} ${REFRESH_TAIL}`;
+  // Windows: launcher-wrapped node-direct, so this fires without a console
+  // window. The old comment here read "no VBS — SessionEnd may need stdout",
+  // which was the right call against a wrapper that replaced the child's
+  // pipes; hook-launcher.exe passes them through, so the refresh keeps its
+  // stdout *and* stops flashing. See ``resolveCaliberHookInvoker``.
+  return `${resolveCaliberHookInvoker()} ${REFRESH_TAIL}`;
 }
 
 interface HookEntry {
@@ -67,14 +70,30 @@ export function isHookInstalled(): boolean {
   return findHookIndex(sessionEnd) !== -1;
 }
 
-export function installHook(): { installed: boolean; alreadyInstalled: boolean } {
+export function installHook(): {
+  installed: boolean;
+  alreadyInstalled: boolean;
+  upgraded: boolean;
+} {
   const settings = readSettings();
 
   if (!settings.hooks) settings.hooks = {};
   if (!Array.isArray(settings.hooks.SessionEnd)) settings.hooks.SessionEnd = [];
 
-  if (findHookIndex(settings.hooks.SessionEnd) !== -1) {
-    return { installed: false, alreadyInstalled: true };
+  const idx = findHookIndex(settings.hooks.SessionEnd);
+  if (idx !== -1) {
+    // Ours, but maybe written by an older version with a different invoker —
+    // the entry's identity does not tell us whether its command still works.
+    const desired = getHookCommand();
+    let upgraded = false;
+    for (const h of settings.hooks.SessionEnd[idx].hooks ?? []) {
+      if (isCaliberCommand(h.command, REFRESH_TAIL) && h.command !== desired) {
+        h.command = desired;
+        upgraded = true;
+      }
+    }
+    if (upgraded) writeSettings(settings);
+    return { installed: false, alreadyInstalled: true, upgraded };
   }
 
   settings.hooks.SessionEnd.push({
@@ -83,7 +102,7 @@ export function installHook(): { installed: boolean; alreadyInstalled: boolean }
   });
 
   writeSettings(settings);
-  return { installed: true, alreadyInstalled: false };
+  return { installed: true, alreadyInstalled: false, upgraded: false };
 }
 
 export function removeHook(): { removed: boolean; notFound: boolean } {

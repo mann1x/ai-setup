@@ -90,9 +90,51 @@ export function areLearningHooksInstalled(): boolean {
   });
 }
 
-export function installLearningHooks(): { installed: boolean; alreadyInstalled: boolean } {
+/**
+ * Rewrite caliber-owned hook commands that no longer match the invoker this
+ * version resolves.
+ *
+ * Installation is identity-checked with ``isCaliberCommand``, which is
+ * deliberately blind to the wrapper prefix — correct for "is this entry ours?"
+ * and wrong for "is this entry current?". Without a refresh, changing *how*
+ * the hook is invoked only ever reaches projects that had no hooks yet: the
+ * ones already running the previous form look installed and get skipped
+ * forever. That is precisely how the wscript wrapper went on discarding
+ * stdin in existing projects long after the resolver stopped emitting it.
+ *
+ * Only the command text is touched. Position, matcher and description are
+ * left alone, so an entry the user reordered or re-described stays theirs.
+ */
+export function refreshLearningHooks(): { updated: number } {
+  const settings = readSettings();
+  if (!settings.hooks) return { updated: 0 };
+
+  let updated = 0;
+  for (const cfg of getHookConfigs()) {
+    const matchers = settings.hooks[cfg.event];
+    if (!Array.isArray(matchers)) continue;
+    for (const entry of matchers) {
+      for (const h of entry.hooks ?? []) {
+        if (isCaliberCommand(h.command, cfg.tail) && h.command !== cfg.command) {
+          h.command = cfg.command;
+          updated++;
+        }
+      }
+    }
+  }
+
+  if (updated > 0) writeSettings(settings);
+  return { updated };
+}
+
+export function installLearningHooks(): {
+  installed: boolean;
+  alreadyInstalled: boolean;
+  refreshed: number;
+} {
   if (areLearningHooksInstalled()) {
-    return { installed: false, alreadyInstalled: true };
+    // Present but possibly stale — an upgrade has to reach these too.
+    return { installed: false, alreadyInstalled: true, refreshed: refreshLearningHooks().updated };
   }
 
   const settings = readSettings();
@@ -113,7 +155,9 @@ export function installLearningHooks(): { installed: boolean; alreadyInstalled: 
   }
 
   writeSettings(settings);
-  return { installed: true, alreadyInstalled: false };
+  // A partially-installed project can hold stale entries next to the ones
+  // just added.
+  return { installed: true, alreadyInstalled: false, refreshed: refreshLearningHooks().updated };
 }
 
 // ── Cursor hooks (https://cursor.com/docs/hooks) ─────────────────────
@@ -160,9 +204,39 @@ export function areCursorLearningHooksInstalled(): boolean {
   });
 }
 
-export function installCursorLearningHooks(): { installed: boolean; alreadyInstalled: boolean } {
+/** ``refreshLearningHooks`` for Cursor's flatter ``.cursor/hooks.json``. */
+export function refreshCursorLearningHooks(): { updated: number } {
+  const config = readCursorHooks();
+  const bin = resolveCaliberHookInvoker();
+
+  let updated = 0;
+  for (const cfg of CURSOR_HOOK_EVENTS) {
+    const entries = config.hooks[cfg.event];
+    if (!Array.isArray(entries)) continue;
+    const desired = `${bin} ${cfg.tail}`;
+    for (const e of entries) {
+      if (isCaliberCommand(e.command, cfg.tail) && e.command !== desired) {
+        e.command = desired;
+        updated++;
+      }
+    }
+  }
+
+  if (updated > 0) writeCursorHooks(config);
+  return { updated };
+}
+
+export function installCursorLearningHooks(): {
+  installed: boolean;
+  alreadyInstalled: boolean;
+  refreshed: number;
+} {
   if (areCursorLearningHooksInstalled()) {
-    return { installed: false, alreadyInstalled: true };
+    return {
+      installed: false,
+      alreadyInstalled: true,
+      refreshed: refreshCursorLearningHooks().updated,
+    };
   }
 
   const config = readCursorHooks();
@@ -180,7 +254,11 @@ export function installCursorLearningHooks(): { installed: boolean; alreadyInsta
   }
 
   writeCursorHooks(config);
-  return { installed: true, alreadyInstalled: false };
+  return {
+    installed: true,
+    alreadyInstalled: false,
+    refreshed: refreshCursorLearningHooks().updated,
+  };
 }
 
 export function removeCursorLearningHooks(): { removed: boolean; notFound: boolean } {

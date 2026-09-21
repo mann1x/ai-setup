@@ -121,10 +121,22 @@ export async function hooksCommand(options: { install?: boolean; remove?: boolea
     if (fs.existsSync('.claude')) {
       const r = installLearningHooks();
       if (r.installed) console.log(chalk.green('  ✓') + ' Claude Code learning hooks enabled');
+      if (r.refreshed > 0) {
+        console.log(
+          chalk.green('  ✓') +
+            ` Claude Code learning hooks: ${r.refreshed} command(s) rewritten for this version`,
+        );
+      }
     }
     if (fs.existsSync('.cursor')) {
       const r = installCursorLearningHooks();
       if (r.installed) console.log(chalk.green('  ✓') + ' Cursor learning hooks enabled');
+      if (r.refreshed > 0) {
+        console.log(
+          chalk.green('  ✓') +
+            ` Cursor learning hooks: ${r.refreshed} command(s) rewritten for this version`,
+        );
+      }
     }
     return;
   }

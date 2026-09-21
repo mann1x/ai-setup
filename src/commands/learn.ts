@@ -533,6 +533,12 @@ export async function learnInstallCommand() {
     } else if (r.alreadyInstalled) {
       console.log(chalk.dim('  Claude Code hooks already installed'));
     }
+    if (r.refreshed > 0) {
+      console.log(
+        chalk.green('✓') + ` ${r.refreshed} Claude Code hook command(s) rewritten for this version`,
+      );
+      anyInstalled = true;
+    }
   }
 
   if (fs.existsSync('.cursor')) {
@@ -542,6 +548,12 @@ export async function learnInstallCommand() {
       anyInstalled = true;
     } else if (r.alreadyInstalled) {
       console.log(chalk.dim('  Cursor hooks already installed'));
+    }
+    if (r.refreshed > 0) {
+      console.log(
+        chalk.green('✓') + ` ${r.refreshed} Cursor hook command(s) rewritten for this version`,
+      );
+      anyInstalled = true;
     }
   }
 
