@@ -1,7 +1,7 @@
 {
   "name": "@rely-ai/caliber",
   "version": "1.55.1",
-  "description": "AI context infrastructure for coding agents — keeps CLAUDE.md, Cursor rules, and skills in sync as your codebase evolves",
+  "description": "AI context infrastructure for coding agents \u2014 keeps CLAUDE.md, Cursor rules, and skills in sync as your codebase evolves",
   "type": "module",
   "bin": {
     "caliber": "./dist/bin.js"
@@ -48,6 +48,7 @@
   "files": [
     "dist/**/*.js",
     "dist/**/*.vbs",
+    "dist/**/*.cs",
     "README.md",
     "LICENSE",
     "dist/**/*.ts",

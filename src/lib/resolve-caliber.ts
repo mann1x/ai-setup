@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 
 let _resolved: string | null = null;
 
@@ -179,17 +179,80 @@ export function resolveWindowsNodeBinInvocation(cmd: string): string | null {
   return `"${fwdNode}" "${fwdBin}"`;
 }
 
-function isWscriptAvailable(): boolean {
+/**
+ * Build ``hook-launcher.exe`` next to ``bin.js`` if it is not there yet, and
+ * return its path.
+ *
+ * Replaces the ``wscript`` + ``hook-runner.vbs`` wrapper, which hid the
+ * console window but broke the hooks it wrapped. ``WScript.Shell.Run`` hands
+ * the child a fresh console rather than the parent's pipes, so a hook reading
+ * stdin saw nothing: ``learn observe`` waited out ``readStdin``'s 5 s timeout,
+ * got an empty string, hit ``if (!raw.trim()) return;`` and recorded nothing —
+ * five seconds per tool call, exit code 0, no error anywhere. Measured
+ * 2026-09-21 on two machines running the same projects: with WSH,
+ * ``eventCount`` 9 and frozen for four months; without it, 13728.
+ *
+ * The launcher instead calls CreateProcess with CREATE_NO_WINDOW *and*
+ * STARTF_USESTDHANDLES pointed at this process's own handles, so the window
+ * is suppressed and stdin/stdout/exit code survive. Both flags are needed;
+ * CREATE_NO_WINDOW alone reproduces the VBS defect, because a child takes its
+ * handles from STARTUPINFO only when STARTF_USESTDHANDLES is set.
+ *
+ * Compiled on demand with the csc.exe that ships with the .NET Framework on
+ * every Windows, so no binary is published. Returns null on every failure —
+ * not Windows, no compiler, no source, unwritable dist, compile error — and
+ * the caller then uses the node-direct form, which works and merely flashes.
+ */
+function ensureHookLauncher(binJs: string): string | null {
+  if (process.platform !== 'win32') return null;
+  const dir = path.dirname(binJs);
+  const exe = path.join(dir, 'hook-launcher.exe');
+  const src = path.join(dir, 'hook-launcher.cs');
   try {
-    const out = execSync('where wscript', {
+    if (fs.existsSync(exe)) {
+      // Rebuild when the shipped source is newer, so an upgrade does not keep
+      // running the previous version's launcher.
+      if (!fs.existsSync(src) || fs.statSync(src).mtimeMs <= fs.statSync(exe).mtimeMs) {
+        return exe;
+      }
+    }
+    if (!fs.existsSync(src)) return null;
+    const csc = findFrameworkCsc();
+    if (!csc) return null;
+    const res = spawnSync(csc, ['/nologo', '/target:winexe', '/optimize+', `/out:${exe}`, src], {
       encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 60_000,
       windowsHide: true,
-    }).trim();
-    return Boolean(pickExecutable(out));
+    });
+    if (res.error || res.status !== 0 || !fs.existsSync(exe)) return null;
+    return exe;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** The csc.exe bundled with the .NET Framework, newest first. */
+function findFrameworkCsc(): string | null {
+  for (const root of [
+    'C:\\Windows\\Microsoft.NET\\Framework64',
+    'C:\\Windows\\Microsoft.NET\\Framework',
+  ]) {
+    let versions: string[];
+    try {
+      versions = fs
+        .readdirSync(root)
+        .filter((v) => v.startsWith('v'))
+        .sort()
+        .reverse();
+    } catch {
+      continue;
+    }
+    for (const v of versions) {
+      const csc = path.join(root, v, 'csc.exe');
+      if (fs.existsSync(csc)) return csc;
+    }
+  }
+  return null;
 }
 
 /**
@@ -197,13 +260,15 @@ function isWscriptAvailable(): boolean {
  * strings (Claude settings.json / Cursor hooks.json learning hooks).
  *
  * On Windows: bypass the ``.cmd`` shim via ``resolveWindowsNodeBinInvocation``,
- * then optionally wrap with ``wscript`` + ``hook-runner.vbs`` when WSH is
- * available (hides the node.exe console flash). If VBS is present but
- * ``wscript`` is missing/blocked (Group Policy / AV), fall back to the
+ * then wrap with ``hook-launcher.exe`` when it can be built (hides the
+ * node.exe console flash). If it cannot be built, fall back to the
  * node-direct form rather than a hard hook failure.
  *
- * Do **not** use the VBS wrapper for hooks that need stdout (pre-commit,
- * SessionEnd refresh) — use ``resolveWindowsNodeBinInvocation`` directly.
+ * The launcher is stdio-transparent, which the previous ``wscript`` +
+ * ``hook-runner.vbs`` wrapper was not — see ``ensureHookLauncher``. So the
+ * old restriction is gone: this is now safe for hooks that need stdin or
+ * stdout, and in fact every hook needs stdin, which is why the VBS silently
+ * emptied the learning pipeline on Windows.
  */
 export function resolveCaliberHookInvoker(): string {
   if (_resolvedHookInvoker) return _resolvedHookInvoker;
@@ -222,11 +287,10 @@ export function resolveCaliberHookInvoker(): string {
     return _resolvedHookInvoker;
   }
   const [, fwdNode, fwdBin] = match;
-  // hook-runner.vbs is co-located with bin.js in dist/
-  const vbsPath = fwdBin.replace(/bin\.js$/i, 'hook-runner.vbs');
-  if (fs.existsSync(vbsPath) && isWscriptAvailable()) {
-    const fwdVbs = vbsPath.replace(/\\/g, '/');
-    _resolvedHookInvoker = `wscript //nologo "${fwdVbs}" "${fwdNode}" "${fwdBin}"`;
+  const launcher = ensureHookLauncher(fwdBin);
+  if (launcher) {
+    const fwdLauncher = launcher.replace(/\\/g, '/');
+    _resolvedHookInvoker = `"${fwdLauncher}" "${fwdNode}" "${fwdBin}"`;
     return _resolvedHookInvoker;
   }
 
@@ -262,10 +326,11 @@ export function isCaliberCommand(command: string, subcommandTail: string): boole
   // whitespace + tail; node prefix is variable across hosts so we don't
   // pin it. Accepts both forward and back slashes inside the quotes
   // because pre-commit shells store forward, claude.json stores either.
-  // ALSO matches the wscript-wrapped form
-  // 'wscript //nologo "<vbs>" "<node>" "<bin.js>" <tail>' because the
-  // bin.js suffix is identical — anything before it is wrapper noise
-  // that doesn't change the caliber identity of the command.
+  // ALSO matches a wrapped form — '"<hook-launcher.exe>" "<node>"
+  // "<bin.js>" <tail>', or the legacy 'wscript //nologo "<vbs>" ...' still
+  // sitting in settings.json from an older install — because the bin.js
+  // suffix is identical, and anything before it is wrapper noise that does
+  // not change the caliber identity of the command.
   if (
     /[\\/]@rely-ai[\\/]caliber[\\/]dist[\\/]bin\.js"? /i.test(command) &&
     command.endsWith(` ${subcommandTail}`)

@@ -8,7 +8,7 @@ import {
   displayCaliberName,
   resolveCaliberHookInvoker,
 } from '../resolve-caliber.js';
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 
 function withPlatform(platform: NodeJS.Platform, fn: () => void): void {
@@ -23,6 +23,7 @@ function withPlatform(platform: NodeJS.Platform, fn: () => void): void {
 
 vi.mock('child_process', () => ({
   execSync: vi.fn(),
+  spawnSync: vi.fn(() => ({ status: 1, error: new Error('no csc in tests') })),
 }));
 
 vi.mock('fs', async () => {
@@ -31,6 +32,37 @@ vi.mock('fs', async () => {
 });
 
 const mockedExecSync = vi.mocked(execSync);
+const mockedSpawnSync = vi.mocked(spawnSync);
+
+/**
+ * Make the on-demand ``hook-launcher.exe`` compile appear to succeed.
+ *
+ * The launcher is built by ``ensureHookLauncher`` from the ``.cs`` source
+ * shipped next to ``bin.js``, so the happy path needs four things to line up:
+ * the source present, a Framework ``csc.exe`` found, a ``csc`` run that exits
+ * 0, and the ``.exe`` on disk afterwards. The exe is absent before the
+ * compile and present after it, which is what ``compiled`` tracks — asserting
+ * against a mock that claims the exe already exists would never exercise the
+ * compile at all.
+ */
+function mockLauncherCompile(): void {
+  let compiled = false;
+  vi.spyOn(fs, 'readdirSync').mockReturnValue(['v4.0.30319', 'v2.0.50727'] as never);
+  vi.spyOn(fs, 'existsSync').mockImplementation((p) => {
+    const s = String(p);
+    if (s.endsWith('hook-launcher.exe')) return compiled;
+    return (
+      s.endsWith('@rely-ai\\caliber\\dist\\bin.js') ||
+      s.endsWith('@rely-ai/caliber/dist/bin.js') ||
+      s.endsWith('hook-launcher.cs') ||
+      s.endsWith('csc.exe')
+    );
+  });
+  mockedSpawnSync.mockImplementation((() => {
+    compiled = true;
+    return { status: 0, stdout: '', stderr: '' };
+  }) as never);
+}
 
 describe('resolveCaliber', () => {
   let originalArgv: string[];
@@ -322,6 +354,14 @@ describe('resolveCaliberHookInvoker (Windows cmd-shim bypass)', () => {
 
   beforeEach(() => {
     resetResolvedCaliber();
+    // Both module mocks are shared across the file, and `not.toHaveBeenCalled`
+    // on a leaked call list is an assertion that passes for the wrong reason.
+    mockedExecSync.mockReset();
+    mockedSpawnSync.mockReset();
+    mockedSpawnSync.mockImplementation((() => ({
+      status: 1,
+      error: new Error('no csc in tests'),
+    })) as never);
     originalArgv = [...process.argv];
     originalEnv = { ...process.env };
   });
@@ -370,49 +410,149 @@ describe('resolveCaliberHookInvoker (Windows cmd-shim bypass)', () => {
     });
   });
 
-  it('on Windows returns wscript-wrapped form when hook-runner.vbs and wscript are present', () => {
+  it('on Windows wraps in hook-launcher.exe, compiling it on demand', () => {
     withPlatform('win32', () => {
       mockedExecSync
         .mockReturnValueOnce('C:\\Users\\u\\AppData\\Roaming\\npm\\caliber.cmd\n')
-        .mockReturnValueOnce('C:\\Program Files\\nodejs\\node.exe\n')
-        .mockReturnValueOnce('C:\\Windows\\System32\\wscript.exe\n');
-      vi.spyOn(fs, 'existsSync').mockImplementation(
-        (p) =>
-          String(p).endsWith('@rely-ai\\caliber\\dist\\bin.js') ||
-          String(p).endsWith('@rely-ai/caliber/dist/bin.js') ||
-          String(p).endsWith('@rely-ai\\caliber\\dist\\hook-runner.vbs') ||
-          String(p).endsWith('@rely-ai/caliber/dist/hook-runner.vbs') ||
-          String(p).endsWith('hook-runner.vbs'),
+        .mockReturnValueOnce('C:\\Program Files\\nodejs\\node.exe\n');
+      mockLauncherCompile();
+
+      const got = resolveCaliberHookInvoker();
+      // '"<launcher>" "<node>" "<bin.js>"' — the launcher replaces the
+      // node.exe console window, not the node invocation inside it, so both
+      // the interpreter and the script stay in the command.
+      expect(got).toMatch(/^"[^"]*hook-launcher\.exe" /);
+      expect(got).toContain('"C:/Program Files/nodejs/node.exe"');
+      expect(got).toContain('@rely-ai/caliber/dist/bin.js"');
+      expect(got).not.toContain('wscript');
+      expect(got).not.toContain('.cmd');
+
+      // Built with the Windows subsystem, or the launcher gets the very
+      // console window it exists to suppress, and from the newest Framework.
+      const [csc, args] = mockedSpawnSync.mock.calls[0] as [string, string[]];
+      expect(csc).toContain('Framework64');
+      expect(csc).toContain('v4.0.30319');
+      expect(args).toContain('/target:winexe');
+      expect(args.some((a) => a.startsWith('/out:') && a.endsWith('hook-launcher.exe'))).toBe(true);
+    });
+  });
+
+  it('on Windows reuses an existing launcher rather than recompiling', () => {
+    withPlatform('win32', () => {
+      mockedExecSync
+        .mockReturnValueOnce('C:\\Users\\u\\AppData\\Roaming\\npm\\caliber.cmd\n')
+        .mockReturnValueOnce('C:\\Program Files\\nodejs\\node.exe\n');
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => {
+        const s = String(p);
+        return (
+          s.endsWith('@rely-ai\\caliber\\dist\\bin.js') ||
+          s.endsWith('@rely-ai/caliber/dist/bin.js') ||
+          s.endsWith('hook-launcher.cs') ||
+          s.endsWith('hook-launcher.exe')
+        );
+      });
+      // Source older than the exe — nothing to rebuild.
+      vi.spyOn(fs, 'statSync').mockImplementation(
+        ((p: fs.PathLike) =>
+          ({ mtimeMs: String(p).endsWith('.cs') ? 1000 : 2000 }) as fs.Stats) as never,
       );
 
       const got = resolveCaliberHookInvoker();
-      expect(got).toMatch(/^wscript /);
-      expect(got).toContain('//nologo');
-      expect(got).toContain('hook-runner.vbs"');
+      expect(got).toMatch(/^"[^"]*hook-launcher\.exe" /);
+      expect(mockedSpawnSync).not.toHaveBeenCalled();
+    });
+  });
+
+  it('on Windows rebuilds the launcher when the shipped source is newer', () => {
+    withPlatform('win32', () => {
+      mockedExecSync
+        .mockReturnValueOnce('C:\\Users\\u\\AppData\\Roaming\\npm\\caliber.cmd\n')
+        .mockReturnValueOnce('C:\\Program Files\\nodejs\\node.exe\n');
+      mockLauncherCompile();
+      // An upgrade ships a new .cs over the previous version's .exe. Keeping
+      // the stale binary is the failure this guards: it would run the old
+      // launcher forever, and the whole point of shipping source is that the
+      // fix arrives with the package.
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => {
+        const s = String(p);
+        return (
+          s.endsWith('@rely-ai\\caliber\\dist\\bin.js') ||
+          s.endsWith('@rely-ai/caliber/dist/bin.js') ||
+          s.endsWith('hook-launcher.cs') ||
+          s.endsWith('hook-launcher.exe') ||
+          s.endsWith('csc.exe')
+        );
+      });
+      vi.spyOn(fs, 'statSync').mockImplementation(
+        ((p: fs.PathLike) =>
+          ({ mtimeMs: String(p).endsWith('.cs') ? 9000 : 1000 }) as fs.Stats) as never,
+      );
+
+      resolveCaliberHookInvoker();
+      expect(mockedSpawnSync).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('on Windows falls back to node-direct when the launcher cannot be built', () => {
+    withPlatform('win32', () => {
+      mockedExecSync
+        .mockReturnValueOnce('C:\\Users\\u\\AppData\\Roaming\\npm\\caliber.cmd\n')
+        .mockReturnValueOnce('C:\\Program Files\\nodejs\\node.exe\n');
+      // Source is there; no Framework csc (readdirSync throws, as it does on
+      // any non-Windows host). A missing compiler must cost the flash, not
+      // the hook — node-direct works, it is merely visible.
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => {
+        const s = String(p);
+        return (
+          s.endsWith('@rely-ai\\caliber\\dist\\bin.js') ||
+          s.endsWith('@rely-ai/caliber/dist/bin.js') ||
+          s.endsWith('hook-launcher.cs')
+        );
+      });
+      vi.spyOn(fs, 'readdirSync').mockImplementation((() => {
+        throw new Error('ENOENT');
+      }) as never);
+
+      const got = resolveCaliberHookInvoker();
+      expect(got).not.toContain('hook-launcher');
       expect(got).toContain('"C:/Program Files/nodejs/node.exe"');
       expect(got).toContain('@rely-ai/caliber/dist/bin.js"');
     });
   });
 
-  it('on Windows falls back to node-direct when VBS exists but wscript is unavailable', () => {
+  it('on Windows falls back to node-direct when the compile fails', () => {
     withPlatform('win32', () => {
       mockedExecSync
         .mockReturnValueOnce('C:\\Users\\u\\AppData\\Roaming\\npm\\caliber.cmd\n')
-        .mockReturnValueOnce('C:\\Program Files\\nodejs\\node.exe\n')
-        .mockImplementationOnce(() => {
-          throw new Error('wscript not on PATH');
-        });
-      vi.spyOn(fs, 'existsSync').mockImplementation(
-        (p) =>
-          String(p).endsWith('@rely-ai\\caliber\\dist\\bin.js') ||
-          String(p).endsWith('@rely-ai/caliber/dist/bin.js') ||
-          String(p).endsWith('hook-runner.vbs'),
-      );
+        .mockReturnValueOnce('C:\\Program Files\\nodejs\\node.exe\n');
+      vi.spyOn(fs, 'readdirSync').mockReturnValue(['v4.0.30319'] as never);
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => {
+        const s = String(p);
+        if (s.endsWith('hook-launcher.exe')) return false;
+        return (
+          s.endsWith('@rely-ai\\caliber\\dist\\bin.js') ||
+          s.endsWith('@rely-ai/caliber/dist/bin.js') ||
+          s.endsWith('hook-launcher.cs') ||
+          s.endsWith('csc.exe')
+        );
+      });
+      mockedSpawnSync.mockImplementation((() => ({
+        status: 1,
+        stdout: '',
+        stderr: 'error CS1002',
+      })) as never);
 
       const got = resolveCaliberHookInvoker();
-      expect(got).not.toMatch(/^wscript /);
-      expect(got).toContain('"C:/Program Files/nodejs/node.exe"');
+      expect(got).not.toContain('hook-launcher');
       expect(got).toContain('@rely-ai/caliber/dist/bin.js"');
+    });
+  });
+
+  it('never builds a launcher off Windows', () => {
+    withPlatform('linux', () => {
+      mockedExecSync.mockReturnValue('/usr/local/bin/caliber\n');
+      expect(resolveCaliberHookInvoker()).toBe('/usr/local/bin/caliber');
+      expect(mockedSpawnSync).not.toHaveBeenCalled();
     });
   });
 
@@ -443,6 +583,27 @@ describe('resolveCaliberHookInvoker (Windows cmd-shim bypass)', () => {
 });
 
 describe('isCaliberCommand — node-direct + .cmd shim variants', () => {
+  it('matches the hook-launcher-wrapped form', () => {
+    // The wrapper prefix must not make an existing entry look foreign, or
+    // the installer writes a second hook alongside the first and every tool
+    // call runs caliber twice.
+    const cmd =
+      '"C:/Users/u/AppData/Roaming/npm/node_modules/@rely-ai/caliber/dist/hook-launcher.exe" ' +
+      '"C:/Program Files/nodejs/node.exe" ' +
+      '"C:/Users/u/AppData/Roaming/npm/node_modules/@rely-ai/caliber/dist/bin.js" learn observe';
+    expect(isCaliberCommand(cmd, 'learn observe')).toBe(true);
+  });
+
+  it('still matches the legacy wscript-wrapped form left in settings.json', () => {
+    // Upgrading replaces the resolver, not the commands already written to
+    // disk; those keep working (visibly, and with the stdio defect) until
+    // something rewrites them.
+    const cmd =
+      'wscript //nologo "C:/x/@rely-ai/caliber/dist/hook-runner.vbs" ' +
+      '"C:/Program Files/nodejs/node.exe" "C:/x/@rely-ai/caliber/dist/bin.js" learn observe';
+    expect(isCaliberCommand(cmd, 'learn observe')).toBe(true);
+  });
+
   it('matches the node-direct hook invoker output format', () => {
     const cmd =
       '"C:/Program Files/nodejs/node.exe" ' +
