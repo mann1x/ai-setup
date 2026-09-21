@@ -163,6 +163,19 @@ describe('learning-hook refresh (an installed hook is not necessarily a current 
     expect(entry.hooks[0].command).toBe('/usr/local/bin/caliber learn observe');
   });
 
+  it('refresh-only never enables a hook the project did not have', async () => {
+    // An upgrade repairs what is installed. Deciding a project should now run
+    // the refresh hook is the user's call, and `--refresh` must not make it.
+    writeSettings({ hooks: {} });
+
+    const { refreshHook } = await import('../hooks.js');
+    const { refreshLearningHooks } = await import('../learning-hooks.js');
+    expect(refreshHook().updated).toBe(0);
+    expect(refreshLearningHooks().updated).toBe(0);
+
+    expect(readSettings()).toEqual({ hooks: {} });
+  });
+
   it('upgrades the SessionEnd refresh hook too', async () => {
     // Same hole in the other installer: findHookIndex() matches on identity,
     // so a stale refresh command reported "already enabled" forever.

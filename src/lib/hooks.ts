@@ -105,6 +105,35 @@ export function installHook(): {
   return { installed: true, alreadyInstalled: false, upgraded: false };
 }
 
+/**
+ * Rewrite the SessionEnd refresh command if it is ours and stale, without
+ * installing it when it is absent.
+ *
+ * ``installHook()`` also upgrades, but it enables the hook as a side effect.
+ * Repairing existing entries and opting a project into a hook it never had
+ * are different operations, and an upgrade must not silently perform the
+ * second one.
+ */
+export function refreshHook(): { updated: number } {
+  const settings = readSettings();
+  const sessionEnd = settings.hooks?.SessionEnd;
+  if (!Array.isArray(sessionEnd)) return { updated: 0 };
+
+  const desired = getHookCommand();
+  let updated = 0;
+  for (const entry of sessionEnd) {
+    for (const h of entry.hooks ?? []) {
+      if (isCaliberCommand(h.command, REFRESH_TAIL) && h.command !== desired) {
+        h.command = desired;
+        updated++;
+      }
+    }
+  }
+
+  if (updated > 0) writeSettings(settings);
+  return { updated };
+}
+
 export function removeHook(): { removed: boolean; notFound: boolean } {
   const settings = readSettings();
   const sessionEnd = settings.hooks?.SessionEnd;

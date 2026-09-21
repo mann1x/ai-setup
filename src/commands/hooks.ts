@@ -19,8 +19,14 @@ import {
   isPostToolUseSyncHookInstalled,
   installPostToolUseSyncHook,
   removePostToolUseSyncHook,
+  refreshHook,
 } from '../lib/hooks.js';
-import { installLearningHooks, installCursorLearningHooks } from '../lib/learning-hooks.js';
+import {
+  installLearningHooks,
+  installCursorLearningHooks,
+  refreshLearningHooks,
+  refreshCursorLearningHooks,
+} from '../lib/learning-hooks.js';
 
 interface HookDef {
   id: string;
@@ -96,14 +102,35 @@ function printStatus() {
 
 // --- Interactive mode (default when running `caliber hooks`) ---
 
-export async function hooksCommand(options: { install?: boolean; remove?: boolean }) {
-  if (!options.install && !options.remove) {
+export async function hooksCommand(options: {
+  install?: boolean;
+  remove?: boolean;
+  refresh?: boolean;
+}) {
+  if (!options.install && !options.remove && !options.refresh) {
     console.log(
       chalk.dim('\n  Note: caliber now adds refresh instructions directly to config files.'),
     );
     console.log(
       chalk.dim('  These hooks are available for non-agent workflows (manual commits).\n'),
     );
+  }
+
+  if (options.refresh) {
+    // Repair only. Rewrites caliber-owned hook commands that an older version
+    // wrote and leaves every enable/disable decision exactly as it is.
+    let total = 0;
+    total += refreshHook().updated;
+    if (fs.existsSync('.claude')) total += refreshLearningHooks().updated;
+    if (fs.existsSync('.cursor')) total += refreshCursorLearningHooks().updated;
+    if (total === 0) {
+      console.log(chalk.dim('  All caliber hook commands are already current.'));
+    } else {
+      console.log(
+        chalk.green('  ✓') + ` ${total} hook command(s) rewritten for this caliber version`,
+      );
+    }
+    return;
   }
 
   if (options.install) {

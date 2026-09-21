@@ -290,6 +290,7 @@ program
   .description('Manage auto-refresh hooks (toggle interactively)')
   .option('--install', 'Enable all hooks non-interactively')
   .option('--remove', 'Disable all hooks non-interactively')
+  .option('--refresh', 'Rewrite stale caliber hook commands, enabling nothing new')
   .action(tracked('hooks', hooksCommand));
 
 program
